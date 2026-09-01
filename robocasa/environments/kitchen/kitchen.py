@@ -1136,7 +1136,6 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                 _elem.set("file", _os.path.relpath(_f, _out_dir_abs).replace("\\", "/"))
         with open(_out_path, "w") as _f:
             _f.write(ET.tostring(_tree, encoding="unicode"))
-        print(f"[Kitchen] Compiled MJCF saved to {_out_path}")
 
         # set up the scene (fixtures, variables, etc)
         self._setup_scene()
@@ -1182,12 +1181,6 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             _jid = self.sim.model.get_joint_qpos_addr(_jname)
             self.sim.data.qpos[_jid] = _qval
         self.sim.forward()
-
-        # Print mobile base qpos after set_robot_base (for Unity comparison)
-        for jname in ["mobilebase0_joint_mobile_forward", "mobilebase0_joint_mobile_side", "mobilebase0_joint_mobile_yaw"]:
-            jid = self.sim.model.get_joint_qpos_addr(jname)
-            print(f"[mobilebase] {jname}: qpos={self.sim.data.qpos[jid]:.8f} (adr={jid})")
-        print(f"[mobilebase] init_robot_base_pos: {self.init_robot_base_pos}")
 
         # step through a few timesteps to settle objects
         action = np.zeros(self.action_spec[0].shape)  # apply empty action
@@ -1301,24 +1294,6 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                         _row += ",0,0,0,0,0,0,0"
                 _row += f",{self.sim.data.ncon}\n"
                 _csv_f.write(_row)
-
-                # Print step 1 and final step
-                if i < 1 or i == _total_steps - 1:
-                    step_num = i + 1
-                    sim_time = self.sim.data.time
-                    print(f"\n[Kitchen._reset_internal] After {step_num} steps (t={sim_time:.4f}s):")
-                    for robot in self.robots:
-                        for jname, qpos_idx in zip(robot.robot_joints, robot._ref_joint_pos_indexes):
-                            dof_idx = self.sim.model.jnt_dofadr[self.sim.model.joint_name2id(jname)]
-                            print(f"  {jname}: qpos={self.sim.data.qpos[qpos_idx]:.8f}  "
-                                  f"qvel={self.sim.data.qvel[dof_idx]:.8f} (adr={qpos_idx})")
-                        for arm in robot.arms:
-                            eef_site_id = robot.eef_site_id[arm]
-                            eef_pos = self.sim.data.site_xpos[eef_site_id]
-                            print(f"  EEF ({arm}) site_xpos: [{eef_pos[0]:.6f} {eef_pos[1]:.6f} {eef_pos[2]:.6f}]")
-                    print(f"  ctrl (first 10): {self.sim.data.ctrl[:10]}")
-
-            print(f"\n[Kitchen._reset_internal] Logging complete ({_total_steps} steps). CSV: {_csv_path}")
 
     def _setup_scene(self):
         pass
