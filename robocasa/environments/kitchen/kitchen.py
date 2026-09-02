@@ -1295,6 +1295,8 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                 _row += f",{self.sim.data.ncon}\n"
                 _csv_f.write(_row)
 
+        print(f"[Kitchen] Robot pose diagnostics saved to {_csv_path}")
+
     def _setup_scene(self):
         pass
 
