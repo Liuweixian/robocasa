@@ -126,6 +126,7 @@ if __name__ == "__main__":
         use_camera_obs=False,
         control_freq=20,
         renderer=args.renderer,
+        seed=28,
     )
 
     # Wrap this with visualization wrapper

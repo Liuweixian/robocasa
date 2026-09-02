@@ -128,6 +128,8 @@ if __name__ == "__main__":
 
     print(colored("Initializing environment...", "yellow"))
 
+    # fixed seed for reproducible scene generation (matches Unity-side import)
+    np.random.seed(28)
     env = robosuite.make(
         **config,
         has_renderer=True,
@@ -137,6 +139,7 @@ if __name__ == "__main__":
         use_camera_obs=False,
         control_freq=20,
         renderer=args.renderer,
+        seed=28,
     )
     env = EnclosingWallRenderWrapper(env, alpha=0.1, enabled=not args.show_walls)
     install_enclosing_wall_hotkeys(env)
