@@ -1,3 +1,4 @@
+import csv
 import os
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -359,6 +360,52 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         60,
     ]
 
+    # fixed robot spawn heading (euler yaw, radians). the robot base is
+    # always spawned with this heading, facing the main wall (+y direction)
+    ROBOT_SPAWN_FIXED_YAW = np.pi / 2.0
+
+    # fixed offsets (meters, world x/y frame) tried in order when the fixed
+    # spawn anchor is blocked, so that placement never depends on the rng
+    ROBOT_SPAWN_FALLBACK_OFFSETS = (
+        (0.0, 0.0),
+        (0.0, -0.15),
+        (-0.15, 0.0),
+        (0.15, 0.0),
+        (0.0, -0.30),
+        (-0.30, 0.0),
+        (0.30, 0.0),
+        (0.0, 0.15),
+        (0.0, 0.30),
+    )
+
+    # robot pose diagnostics file (written next to the robocasa package on
+    # every reset, one row per simulation step)
+    ROBOT_POSE_DIAGNOSTICS_FILE = "robot-pose-diagnostics.csv"
+
+    # arm joints recorded in the diagnostics file
+    DIAG_ARM_JOINTS = tuple(f"robot0_joint{i}" for i in range(1, 8))
+    # arm joints whose bias / constraint forces are recorded
+    DIAG_QFRC_JOINTS = ("robot0_joint1", "robot0_joint2")
+    # mobile base joints recorded in the diagnostics file
+    DIAG_MOBILE_JOINTS = (
+        "mobilebase0_joint_torso_height",
+        "mobilebase0_joint_mobile_forward",
+        "mobilebase0_joint_mobile_side",
+        "mobilebase0_joint_mobile_yaw",
+    )
+    # robot bodies whose poses are recorded in the diagnostics file
+    DIAG_BODIES = (
+        "robot0_base",
+        "mobilebase0_base",
+        "mobilebase0_fixed_support",
+        "mobilebase0_support",
+        "manipulator_mount",
+        "robot0_link0",
+    )
+    # eef site and actuator name prefixes recorded in the diagnostics file
+    DIAG_EEF_SITE = "gripper0_right_grip_site"
+    DIAG_ACTUATOR_PREFIXES = ("robot0", "mobilebase0", "gripper0")
+
     def __init__(
         self,
         robots,
@@ -410,6 +457,9 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         use_cotraining_cameras=False,
         use_novel_instructions=False,
     ):
+        # handle of the robot pose diagnostics file (opened on every reset)
+        self._diag_csv_file = None
+
         self.init_robot_base_ref = init_robot_base_ref
 
         self.robot_spawn_deviation_pos_x = robot_spawn_deviation_pos_x
@@ -835,7 +885,7 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         (
             self.init_robot_base_pos_anchor,
             self.init_robot_base_ori_anchor,
-        ) = EnvUtils.init_robot_base_pose(self)
+        ) = self.init_robot_base_pose_by_fixture("Microwave")
 
         robot_model = self.robots[0].robot_model
         # set the robot way out of the scene at the start, it will be placed correctly later
@@ -863,6 +913,50 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         print(f"[Kitchen] MJCF saved to {out_path}")
 
         self.robot_geom_ids = None
+
+    def init_robot_base_pose_by_fixture(self, fixture_type="Microwave"):
+        """
+        Initialize the robot base pose near a specific fixture type,
+        deterministically selecting the first matching fixture instead of
+        randomly sampling. Mirrors EnvUtils.init_robot_base_pose but takes
+        the fixture type as a parameter.
+
+        Args:
+            fixture_type (str): class name of the fixture to spawn near
+                (e.g. "Microwave", "Sink", "Stove")
+
+        Returns:
+            2-tuple:
+                pos (np.array): (x, y, z) spawn position
+                ori (np.array): (roll, pitch, yaw) euler spawn orientation
+        """
+        # deterministically find the first fixture of the requested type
+        ref_fixture = None
+        for fxtr in self.fixtures.values():
+            if type(fxtr).__name__ == fixture_type:
+                ref_fixture = fxtr
+                break
+
+        if ref_fixture is None:
+            raise ValueError(
+                f"No fixture of type '{fixture_type}' found in the scene. "
+                f"Available fixture types: "
+                f"{sorted({type(f).__name__ for f in self.fixtures.values()})}"
+            )
+
+        # find an object flagged to initialize the robot near, if any
+        ref_object = None
+        for cfg in self.object_cfgs:
+            if cfg.get("init_robot_here", None) is True:
+                ref_object = cfg.get("name")
+                break
+
+        robot_base_pos, robot_base_ori = EnvUtils.compute_robot_base_placement_pose(
+            self,
+            ref_fixture=ref_fixture,
+            ref_object=ref_object,
+        )
+        return robot_base_pos, robot_base_ori
 
     def _create_objects(self):
         """
@@ -1160,142 +1254,220 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             EnvUtils.set_robot_to_position(self, self.init_robot_base_pos)
             self.sim.forward()
         else:
-            robot_pos = EnvUtils.set_robot_base(
-                env=self,
-                anchor_pos=self.init_robot_base_pos_anchor,
-                anchor_ori=self.init_robot_base_ori_anchor,
-                rot_dev=self.robot_spawn_deviation_rot,
-                pos_dev_x=self.robot_spawn_deviation_pos_x,
-                pos_dev_y=self.robot_spawn_deviation_pos_y,
+            # deterministic placement at the fixture-relative anchor
+            EnvUtils.set_robot_to_position(self, self.init_robot_base_pos_anchor)
+            self.sim.forward()
+            self.init_robot_base_pos = np.array(
+                self.init_robot_base_pos_anchor, dtype=float
             )
-            self.init_robot_base_pos = robot_pos
             self.init_robot_base_ori = self.init_robot_base_ori_anchor
 
-        # Override mobile base joints with fixed values to match Unity
-        _fixed_base_joints = {
-            "mobilebase0_joint_mobile_forward": -10.8,
-            "mobilebase0_joint_mobile_side": 6.13533735,
-            "mobilebase0_joint_mobile_yaw": 0.0,
-        }
-        for _jname, _qval in _fixed_base_joints.items():
-            _jid = self.sim.model.get_joint_qpos_addr(_jname)
-            self.sim.data.qpos[_jid] = _qval
-        self.sim.forward()
+        # start a fresh robot pose diagnostics file for this episode
+        self._open_robot_pose_diagnostics()
 
         # step through a few timesteps to settle objects
         action = np.zeros(self.action_spec[0].shape)  # apply empty action
 
-        # Resolve all robot joint qpos/qvel addresses
-        _robot_joint_names = []
-        _robot_joint_qpos = []
-        _robot_joint_dof = []
-        for robot in self.robots:
-            for jname, qpos_idx in zip(robot.robot_joints, robot._ref_joint_pos_indexes):
-                jid = self.sim.model.joint_name2id(jname)
-                _robot_joint_names.append(jname)
-                _robot_joint_qpos.append(qpos_idx)
-                _robot_joint_dof.append(self.sim.model.jnt_dofadr[jid])
+        # Since the env.step frequency is slower than the mjsim timestep frequency, the internal controller will output
+        # multiple torque commands in between new high level action commands. Therefore, we need to denote via
+        # 'policy_step' whether the current step we're taking is simply an internal update of the controller,
+        # or an actual policy update
+        policy_step = True
 
-        # Resolve mobile base + torso joint addresses
-        _aux_joint_names = [
-            "mobilebase0_joint_torso_height",
-            "mobilebase0_joint_mobile_forward",
-            "mobilebase0_joint_mobile_side",
-            "mobilebase0_joint_mobile_yaw",
+        # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
+        # (as defined by the control frequency specified at the environment level)
+        for i in range(10 * int(self.control_timestep / self.model_timestep)):
+            self.sim.step1()
+            self._pre_action(action, policy_step)
+            self.sim.step2()
+            self._write_robot_pose_diagnostics_row()
+            policy_step = False
+
+    def _open_robot_pose_diagnostics(self):
+        """
+        Opens a fresh robot pose diagnostics csv file for this episode
+        (truncating any previous one) and caches the sim indices of all
+        recorded joints, bodies, actuators, and the eef site. Rows are then
+        written once per simulation step.
+        """
+        self._close_robot_pose_diagnostics()
+
+        self._diag_csv_path = os.path.join(
+            os.path.dirname(robocasa.__file__), self.ROBOT_POSE_DIAGNOSTICS_FILE
+        )
+        self._diag_step_num = 0
+
+        # (qpos addr, dof addr) per recorded joint; None if joint is missing
+        self._diag_joint_addrs = {
+            name: self._diag_resolve_joint_addrs(name)
+            for name in self.DIAG_ARM_JOINTS + self.DIAG_MOBILE_JOINTS
+        }
+        self._diag_qfrc_addrs = [
+            self._diag_resolve_joint_addrs(name) for name in self.DIAG_QFRC_JOINTS
         ]
-        _aux_joint_qpos = []
-        _aux_joint_dof = []
-        for jname_aux in _aux_joint_names:
-            aux_idx = self.sim.model.get_joint_qpos_addr(jname_aux)
-            aux_jid = self.sim.model.joint_name2id(jname_aux)
-            _aux_joint_qpos.append(aux_idx)
-            _aux_joint_dof.append(self.sim.model.jnt_dofadr[aux_jid])
 
-        # Resolve EEF site
-        _eef_site_id = None
-        for robot in self.robots:
-            for arm in robot.arms:
-                _eef_site_id = robot.eef_site_id[arm]
-                break
-            break
+        # robot actuator indices (in model order) for the ctrl columns
+        self._diag_actuator_ids = [
+            idx
+            for idx, name in enumerate(self.sim.model.actuator_names)
+            if name.startswith(self.DIAG_ACTUATOR_PREFIXES)
+        ]
 
-        # Resolve body addresses for transform logging
-        _body_names = ["robot0_base", "mobilebase0_base", "mobilebase0_fixed_support",
-                       "mobilebase0_support", "manipulator_mount", "robot0_link0"]
-        _body_ids = []
-        for bname in _body_names:
-            try:
-                _body_ids.append(self.sim.model.body_name2id(bname))
-            except Exception:
-                _body_ids.append(-1)
+        self._diag_body_ids = {
+            name: self._diag_lookup(self.sim.model.body_name2id, name)
+            for name in self.DIAG_BODIES
+        }
+        self._diag_eef_site_id = self._diag_lookup(
+            self.sim.model.site_name2id, self.DIAG_EEF_SITE
+        )
 
-        # j1/j2 dof addresses (for qfrc_bias / qfrc_constraint logging)
-        _j1_dof = self.sim.model.jnt_dofadr[self.sim.model.joint_name2id("robot0_joint1")]
-        _j2_dof = self.sim.model.jnt_dofadr[self.sim.model.joint_name2id("robot0_joint2")]
+        header = ["step", "t"]
+        for name in self.DIAG_ARM_JOINTS:
+            header += [f"{name}_qpos", f"{name}_qvel"]
+        for name in self.DIAG_QFRC_JOINTS:
+            header += [f"{name}_qfrc_bias", f"{name}_qfrc_constraint"]
+        for name in self.DIAG_MOBILE_JOINTS:
+            header += [f"{name}_qpos", f"{name}_qvel"]
+        header += [f"ctrl[{i}]" for i in range(len(self._diag_actuator_ids))]
+        header += ["eef_x", "eef_y", "eef_z"]
+        for name in self.DIAG_BODIES:
+            header += [
+                f"{name}_x",
+                f"{name}_y",
+                f"{name}_z",
+                f"{name}_qx",
+                f"{name}_qy",
+                f"{name}_qz",
+                f"{name}_qw",
+            ]
+        header += ["ncon"]
 
-        # Open unified CSV
-        import os as _os
-        _csv_path = _os.path.join(_os.path.dirname(robocasa.models.assets_root), "..", "robot-pose-diagnostics.csv")
-        _total_steps = 10 * int(self.control_timestep / self.model_timestep) + 250  # settle + post-settle
-        self.sim.data.ctrl[:] = 0.0
+        self._diag_csv_file = open(self._diag_csv_path, "w", newline="")
+        self._diag_csv_writer = csv.writer(self._diag_csv_file)
+        self._diag_csv_writer.writerow(header)
+        self._diag_csv_file.flush()
+        print(f"[Kitchen] robot pose diagnostics -> {self._diag_csv_path}")
 
-        with open(_csv_path, "w") as _csv_f:
-            # Header: step, t, {robot joints}_qpos/qvel, j1/j2 qfrc_bias/qfrc_constraint,
-            #         {aux joints}_qpos/qvel, ctrl[], eef, {bodies}, ncon
-            _hdr = "step,t"
-            for jn in _robot_joint_names:
-                _hdr += f",{jn}_qpos,{jn}_qvel"
-            _hdr += ",robot0_joint1_qfrc_bias,robot0_joint1_qfrc_constraint"
-            _hdr += ",robot0_joint2_qfrc_bias,robot0_joint2_qfrc_constraint"
-            for jn in _aux_joint_names:
-                _hdr += f",{jn}_qpos,{jn}_qvel"
-            for ci in range(len(self.sim.data.ctrl)):
-                _hdr += f",ctrl[{ci}]"
-            _hdr += ",eef_x,eef_y,eef_z"
-            for bn in _body_names:
-                _hdr += f",{bn}_x,{bn}_y,{bn}_z,{bn}_qx,{bn}_qy,{bn}_qz,{bn}_qw"
-            _hdr += ",ncon\n"
-            _csv_f.write(_hdr)
+    def _write_robot_pose_diagnostics_row(self):
+        """
+        Appends one row to the robot pose diagnostics csv capturing the
+        current sim state: joint positions/velocities/forces, actuator
+        controls, eef position, robot body poses, and contact count.
+        """
+        if self._diag_csv_file is None:
+            return
 
-            _settle_steps = 10 * int(self.control_timestep / self.model_timestep)
-            _post_action = np.zeros(self.action_spec[0].shape)
-            _post_policy_step = True
+        self._diag_step_num += 1
+        row = [self._diag_step_num, f"{self.sim.data.time:.6f}"]
 
-            for i in range(_total_steps):
-                self.sim.step1()
-                if i < _settle_steps:
-                    self.sim.data.ctrl[:] = 0.0
-                else:
-                    self._pre_action(_post_action, _post_policy_step)
-                    _post_policy_step = False
-                self.sim.step2()
+        # arm joint qpos / qvel
+        for name in self.DIAG_ARM_JOINTS:
+            row += self._diag_joint_state_cols(name)
 
-                # CSV row
-                _row = f"{i+1},{self.sim.data.time:.6f}"
-                for qpos_idx, dof_idx in zip(_robot_joint_qpos, _robot_joint_dof):
-                    _row += f",{self.sim.data.qpos[qpos_idx]:.10f},{self.sim.data.qvel[dof_idx]:.10f}"
-                _row += f",{self.sim.data.qfrc_bias[_j1_dof]:.10f},{self.sim.data.qfrc_constraint[_j1_dof]:.10f}"
-                _row += f",{self.sim.data.qfrc_bias[_j2_dof]:.10f},{self.sim.data.qfrc_constraint[_j2_dof]:.10f}"
-                for qpos_idx, dof_idx in zip(_aux_joint_qpos, _aux_joint_dof):
-                    _row += f",{self.sim.data.qpos[qpos_idx]:.10f},{self.sim.data.qvel[dof_idx]:.10f}"
-                for ci in range(len(self.sim.data.ctrl)):
-                    _row += f",{self.sim.data.ctrl[ci]:.10f}"
-                if _eef_site_id is not None:
-                    eef = self.sim.data.site_xpos[_eef_site_id]
-                    _row += f",{eef[0]:.6f},{eef[1]:.6f},{eef[2]:.6f}"
-                else:
-                    _row += ",0,0,0"
-                for bid in _body_ids:
-                    if bid >= 0:
-                        pos = self.sim.data.xpos[bid]
-                        quat = self.sim.data.xquat[bid]
-                        _row += f",{pos[0]:.6f},{pos[1]:.6f},{pos[2]:.6f},{quat[0]:.6f},{quat[1]:.6f},{quat[2]:.6f},{quat[3]:.6f}"
-                    else:
-                        _row += ",0,0,0,0,0,0,0"
-                _row += f",{self.sim.data.ncon}\n"
-                _csv_f.write(_row)
+        # bias / constraint forces for the first two arm joints
+        for addrs in self._diag_qfrc_addrs:
+            if addrs is None:
+                row += ["", ""]
+                continue
+            dof_addr = addrs[1]
+            row += [
+                f"{self.sim.data.qfrc_bias[dof_addr]:.10f}",
+                f"{self.sim.data.qfrc_constraint[dof_addr]:.10f}",
+            ]
 
-        print(f"[Kitchen] Robot pose diagnostics saved to {_csv_path}")
+        # mobile base joint qpos / qvel
+        for name in self.DIAG_MOBILE_JOINTS:
+            row += self._diag_joint_state_cols(name)
+
+        # actuator controls
+        for actuator_id in self._diag_actuator_ids:
+            row.append(f"{self.sim.data.ctrl[actuator_id]:.10f}")
+
+        # end effector position
+        if self._diag_eef_site_id is None:
+            row += ["", "", ""]
+        else:
+            eef_pos = self.sim.data.site_xpos[self._diag_eef_site_id]
+            row += [f"{eef_pos[0]:.6f}", f"{eef_pos[1]:.6f}", f"{eef_pos[2]:.6f}"]
+
+        # body poses (quaternions converted to x, y, z, w order)
+        for name in self.DIAG_BODIES:
+            body_id = self._diag_body_ids[name]
+            if body_id is None:
+                row += [""] * 7
+                continue
+            pos = self.sim.data.body_xpos[body_id]
+            # mujoco stores quaternions as (w, x, y, z)
+            quat = self.sim.data.body_xquat[body_id]
+            row += [
+                f"{pos[0]:.6f}",
+                f"{pos[1]:.6f}",
+                f"{pos[2]:.6f}",
+                f"{quat[1]:.6f}",
+                f"{quat[2]:.6f}",
+                f"{quat[3]:.6f}",
+                f"{quat[0]:.6f}",
+            ]
+
+        # number of active contacts
+        row.append(int(self.sim.data.ncon))
+
+        self._diag_csv_writer.writerow(row)
+        self._diag_csv_file.flush()
+
+    def _diag_joint_state_cols(self, joint_name):
+        """
+        Returns the qpos / qvel csv columns for a recorded joint
+        (empty strings if the joint is not in the model).
+        """
+        addrs = self._diag_joint_addrs[joint_name]
+        if addrs is None:
+            return ["", ""]
+        qpos_addr, dof_addr = addrs
+        return [
+            f"{self.sim.data.qpos[qpos_addr]:.10f}",
+            f"{self.sim.data.qvel[dof_addr]:.10f}",
+        ]
+
+    def _diag_resolve_joint_addrs(self, joint_name):
+        """
+        Resolves a 1-dof joint name to its (qpos addr, dof addr).
+        Returns None if the joint is not in the model.
+        """
+        if self._diag_lookup(self.sim.model.joint_name2id, joint_name) is None:
+            return None
+        return (
+            int(self.sim.model.get_joint_qpos_addr(joint_name)),
+            int(self.sim.model.get_joint_qvel_addr(joint_name)),
+        )
+
+    def _diag_lookup(self, name2id_fn, name):
+        """
+        Mujoco name -> id lookup that returns None instead of raising
+        when the element is not part of the model.
+        """
+        try:
+            return name2id_fn(name)
+        except ValueError:
+            return None
+
+    def _close_robot_pose_diagnostics(self):
+        """
+        Closes the robot pose diagnostics file, if one is open.
+        """
+        if getattr(self, "_diag_csv_file", None) is not None:
+            self._diag_csv_file.close()
+            self._diag_csv_file = None
+
+    def _update_observables(self, force=False):
+        super()._update_observables(force=force)
+        # record one diagnostics row per simulation step taken via env.step()
+        if not force and self._diag_csv_file is not None:
+            self._write_robot_pose_diagnostics_row()
+
+    def close(self):
+        self._close_robot_pose_diagnostics()
+        super().close()
 
     def _setup_scene(self):
         pass
