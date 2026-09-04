@@ -3,6 +3,7 @@ import json
 import time
 from collections import OrderedDict
 
+from pynput.keyboard import Key, Listener
 import robosuite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
@@ -61,6 +62,55 @@ def choose_option(
 
     # Return the chosen environment name
     return choice
+
+
+def install_key_press_diagnostics(env):
+    """
+    Annotate the robot pose diagnostics csv (robot-pose-diagnostics.csv) with
+    the keyboard keys that command the robot. Each recorded key press is
+    queued on the base env and tagged onto the "key" column of the next
+    diagnostics row written, so the arm poses responding to each key can be
+    identified in the csv.
+
+    Only keys the Keyboard device turns into robot commands are recorded:
+    motion keys on press (arrows, . ; e r y h o p) and action keys on release
+    (space toggles gripper, b base mode, s arm switch, = robot switch, q reset).
+    """
+    # idempotent: if already installed, no-op
+    if getattr(env, "_key_press_diag_listener", None) is not None:
+        return
+
+    base_env = env
+    while hasattr(base_env, "env"):
+        base_env = base_env.env
+
+    motion_chars = {".", ";", "e", "r", "y", "h", "o", "p"}
+    action_chars = {"b", "s", "=", "q"}
+
+    def record(key_name):
+        key_presses = getattr(base_env, "_diag_key_presses", None)
+        if key_presses is not None:
+            key_presses.append(key_name)
+
+    def on_press(key):
+        if key in (Key.up, Key.down, Key.left, Key.right):
+            record(key.name)
+            return
+        char = getattr(key, "char", None)
+        if char in motion_chars:
+            record(char)
+
+    def on_release(key):
+        if key == Key.space:
+            record("space")
+            return
+        char = getattr(key, "char", None)
+        if char in action_chars:
+            record(char)
+
+    listener = Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    env._key_press_diag_listener = listener
 
 
 if __name__ == "__main__":
@@ -143,6 +193,7 @@ if __name__ == "__main__":
         from robosuite.devices import Keyboard
 
         device = Keyboard(env=env, pos_sensitivity=4.0, rot_sensitivity=4.0)
+        install_key_press_diagnostics(env)
     elif device == "spacemouse":
         from robosuite.devices import SpaceMouse
 

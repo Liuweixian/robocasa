@@ -381,6 +381,9 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
     # robot pose diagnostics file (written next to the robocasa package on
     # every reset, one row per simulation step)
     ROBOT_POSE_DIAGNOSTICS_FILE = "robot-pose-diagnostics.csv"
+    # moving-segment diagnostics file: only rows from when robot motion
+    # starts until the robot is at rest again (same columns as above)
+    ROBOT_MOVING_DIAGNOSTICS_FILE = "robot-moving-diagnostics.csv"
 
     # arm joints recorded in the diagnostics file
     DIAG_ARM_JOINTS = tuple(f"robot0_joint{i}" for i in range(1, 8))
@@ -405,6 +408,18 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
     # eef site and actuator name prefixes recorded in the diagnostics file
     DIAG_EEF_SITE = "gripper0_right_grip_site"
     DIAG_ACTUATOR_PREFIXES = ("robot0", "mobilebase0", "gripper0")
+
+    # joint name prefixes whose velocities drive the motion gate
+    DIAG_MOTION_JOINT_PREFIXES = ("robot0", "mobilebase0", "gripper0")
+    # motion gate for the moving-segment diagnostics file: a segment starts
+    # when any robot joint velocity exceeds the start threshold and ends
+    # after this many consecutive steps below the stop threshold. The full
+    # trace csv (robot-pose-diagnostics.csv) is never gated. Thresholds sit
+    # above the ~1e-3..6e-3 rad/s band where the arm rings after settling
+    # or after motion, and well below real teleop motion (>= 2e-2 rad/s).
+    DIAG_MOTION_VEL_START = 1e-2  # rad/s
+    DIAG_MOTION_VEL_STOP = 5e-3  # rad/s
+    DIAG_MOTION_QUIET_STEPS = 50  # sim steps
 
     def __init__(
         self,
@@ -1285,17 +1300,39 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
 
     def _open_robot_pose_diagnostics(self):
         """
-        Opens a fresh robot pose diagnostics csv file for this episode
-        (truncating any previous one) and caches the sim indices of all
-        recorded joints, bodies, actuators, and the eef site. Rows are then
-        written once per simulation step.
+        Opens fresh robot pose diagnostics csv files for this episode
+        (truncating any previous ones) and caches the sim indices of all
+        recorded joints, bodies, actuators, and the eef site. The full
+        trace csv gets one row per simulation step; the moving-segment csv
+        only gets rows while the robot is moving (motion start -> rest).
         """
         self._close_robot_pose_diagnostics()
 
         self._diag_csv_path = os.path.join(
             os.path.dirname(robocasa.__file__), self.ROBOT_POSE_DIAGNOSTICS_FILE
         )
+        self._diag_moving_csv_path = os.path.join(
+            os.path.dirname(robocasa.__file__), self.ROBOT_MOVING_DIAGNOSTICS_FILE
+        )
         self._diag_step_num = 0
+
+        # keyboard key presses pending annotation, queued by the teleop key
+        # listener (see demo_teleop.install_key_press_diagnostics) and drained
+        # into the "key" column of each trace row as it is written
+        self._diag_key_presses = []
+        # key presses buffered for the moving-segment csv: flushed into the
+        # "key" column of the next moving row that gets written, so a motion
+        # segment's first row is tagged with the keys that led to the motion
+        self._diag_moving_pending_keys = []
+
+        # motion gate state for the moving-segment csv
+        self._diag_motion_recording = False
+        self._diag_motion_quiet_steps = 0
+        self._diag_motion_dof_addrs = [
+            int(self.sim.model.get_joint_qvel_addr(name))
+            for name in self.sim.model.joint_names
+            if name.startswith(self.DIAG_MOTION_JOINT_PREFIXES)
+        ]
 
         # (qpos addr, dof addr) per recorded joint; None if joint is missing
         self._diag_joint_addrs = {
@@ -1340,13 +1377,18 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
                 f"{name}_qz",
                 f"{name}_qw",
             ]
-        header += ["ncon"]
+        header += ["ncon", "key"]
 
         self._diag_csv_file = open(self._diag_csv_path, "w", newline="")
         self._diag_csv_writer = csv.writer(self._diag_csv_file)
         self._diag_csv_writer.writerow(header)
         self._diag_csv_file.flush()
+        self._diag_moving_csv_file = open(self._diag_moving_csv_path, "w", newline="")
+        self._diag_moving_csv_writer = csv.writer(self._diag_moving_csv_file)
+        self._diag_moving_csv_writer.writerow(header)
+        self._diag_moving_csv_file.flush()
         print(f"[Kitchen] robot pose diagnostics -> {self._diag_csv_path}")
+        print(f"[Kitchen] moving-segment diagnostics -> {self._diag_moving_csv_path}")
 
     def _write_robot_pose_diagnostics_row(self):
         """
@@ -1359,6 +1401,49 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
 
         self._diag_step_num += 1
         row = [self._diag_step_num, f"{self.sim.data.time:.6f}"]
+        row += self._build_robot_pose_row()
+
+        # keyboard key press(es) observed since the previous row, if any;
+        # also buffered for the next moving-segment csv row
+        key_presses = []
+        while self._diag_key_presses:
+            key_presses.append(self._diag_key_presses.pop(0))
+        self._diag_moving_pending_keys.extend(key_presses)
+        row.append("|".join(key_presses))
+
+        self._diag_csv_writer.writerow(row)
+        self._diag_csv_file.flush()
+
+    def _write_moving_diagnostics_row(self):
+        """
+        Appends one row to the moving-segment diagnostics csv (same columns
+        as the pose diagnostics csv) for a simulation step during which the
+        robot is moving (see _update_motion_gate). The "key" column flushes
+        the key presses buffered since the previous moving row, so a motion
+        segment's first row is tagged with the keys that led to the motion.
+        """
+        if getattr(self, "_diag_moving_csv_file", None) is None:
+            return
+
+        key_presses = []
+        while self._diag_moving_pending_keys:
+            key_presses.append(self._diag_moving_pending_keys.pop(0))
+
+        row = [self._diag_step_num, f"{self.sim.data.time:.6f}"]
+        row += self._build_robot_pose_row()
+        row.append("|".join(key_presses))
+
+        self._diag_moving_csv_writer.writerow(row)
+        self._diag_moving_csv_file.flush()
+
+    def _build_robot_pose_row(self):
+        """
+        Builds the per-simulation-step data columns shared by the pose and
+        moving-segment diagnostics rows (everything between the step/t and
+        key columns): joint positions/velocities/forces, actuator controls,
+        eef position, robot body poses, and contact count.
+        """
+        row = []
 
         # arm joint qpos / qvel
         for name in self.DIAG_ARM_JOINTS:
@@ -1412,8 +1497,38 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         # number of active contacts
         row.append(int(self.sim.data.ncon))
 
-        self._diag_csv_writer.writerow(row)
-        self._diag_csv_file.flush()
+        return row
+
+    def _update_motion_gate(self):
+        """
+        Tracks whether the robot is currently moving and returns True if a
+        moving-segment csv row should be written for the current simulation
+        step. A segment starts when any robot joint velocity exceeds
+        DIAG_MOTION_VEL_START and ends once velocities stay below
+        DIAG_MOTION_VEL_STOP for DIAG_MOTION_QUIET_STEPS consecutive steps.
+        """
+        if not self._diag_motion_dof_addrs:
+            return True
+
+        max_vel = float(
+            np.abs(self.sim.data.qvel[self._diag_motion_dof_addrs]).max()
+        )
+
+        if self._diag_motion_recording:
+            if max_vel > self.DIAG_MOTION_VEL_STOP:
+                self._diag_motion_quiet_steps = 0
+                return True
+            self._diag_motion_quiet_steps += 1
+            if self._diag_motion_quiet_steps > self.DIAG_MOTION_QUIET_STEPS:
+                self._diag_motion_recording = False
+                return False
+            return True
+
+        if max_vel > self.DIAG_MOTION_VEL_START:
+            self._diag_motion_recording = True
+            self._diag_motion_quiet_steps = 0
+            return True
+        return False
 
     def _diag_joint_state_cols(self, joint_name):
         """
@@ -1453,17 +1568,24 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
 
     def _close_robot_pose_diagnostics(self):
         """
-        Closes the robot pose diagnostics file, if one is open.
+        Closes the robot pose diagnostics files, if any are open.
         """
         if getattr(self, "_diag_csv_file", None) is not None:
             self._diag_csv_file.close()
             self._diag_csv_file = None
+        if getattr(self, "_diag_moving_csv_file", None) is not None:
+            self._diag_moving_csv_file.close()
+            self._diag_moving_csv_file = None
 
     def _update_observables(self, force=False):
         super()._update_observables(force=force)
-        # record one diagnostics row per simulation step taken via env.step()
+        # record one trace row per simulation step taken via env.step();
+        # while the robot is moving, the same step is also appended to the
+        # moving-segment csv
         if not force and self._diag_csv_file is not None:
             self._write_robot_pose_diagnostics_row()
+            if self._update_motion_gate():
+                self._write_moving_diagnostics_row()
 
     def close(self):
         self._close_robot_pose_diagnostics()
